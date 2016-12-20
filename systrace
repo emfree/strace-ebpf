@@ -2,11 +2,14 @@
 
 # FIXME:
 # always trace syscall return if you can get args there?
+from __future__ import print_function
 
 import bcc
-import time
-import re
+
 import argparse
+import re
+import sys
+import time
 
 
 def gen_syscall_table():
@@ -28,6 +31,7 @@ def parse_args():
                         help='Record timing information')
     parser.add_argument('-d', '--debug', action='store_true',
                         help='Print BPF text')
+    parser.add_argument('-e', '--event', help='Filter (TODO)')
     return parser.parse_args()
 
 
@@ -72,6 +76,7 @@ def build_program(pid, trace_latency):
         '''
         sys_exit_probe = '''
             TRACEPOINT_PROBE(raw_syscalls, sys_exit) {
+                %(pid_filter)s
                 struct key_t key = {0};
                 key.syscall_nr = args->id;
                 key.tid = (u32) bpf_get_current_pid_tgid();
@@ -84,16 +89,30 @@ def build_program(pid, trace_latency):
                     u64 *t  = tottimes.lookup_or_init(&key.syscall_nr, &zero);
                     total = *t;
                     total += (now - *start);
-
                     tottimes.update(&key.syscall_nr, &total);
                 }
+
                 return 0;
             }
-        '''
+        ''' % {'pid_filter': pid_filter}
 
     return program_template % {'pid_filter': pid_filter,
                                'latency_start': latency_start,
                                'sys_exit_probe': sys_exit_probe}
+
+
+def format_output(bpf, syscall_table, event_filter):
+    counts = {k.value: v.value for k, v in bpf['counts'].items()}
+    tottimes = {k.value: v.value for k, v in bpf['tottimes'].items()}
+
+    table = []
+    for k, v in counts.items():
+        table.append((syscall_table[k], v, tottimes.get(k, 0) / 1e6 / v))
+
+    for row in sorted(table):
+        if event_filter and row[0] != event_filter:
+            continue
+        print('%-22s %-12d %-12f' % row)
 
 
 def main():
@@ -105,14 +124,16 @@ def main():
     b = bcc.BPF(text=program_text)
 
     while True:
-        counts = b['counts']
-        stats = [(k.value, v.value) for k, v in counts.items()]
-        tottimes = {k.value: v.value for k, v in b['tottimes'].items()}
+        format_output(b, syscall_table, args.event)
+        print('\n\n')
 
-        for syscall_nr, count in sorted(stats):
-            print (syscall_table[syscall_nr], count,
-                   (tottimes.get(syscall_nr, 0) / 1e9 / count))
-        print '\n\n'
+# debug
+#        while True:
+#            line = b.trace_readline(nonblocking=True)
+#            if line:
+#                print(line, file=sys.stderr)
+#            else:
+#                break
         time.sleep(1)
 
 
