@@ -1,0 +1,120 @@
+#!/usr/bin/env python
+
+# FIXME:
+# always trace syscall return if you can get args there?
+
+import bcc
+import time
+import re
+import argparse
+
+
+def gen_syscall_table():
+    table = {}
+    pattern = re.compile('^#define __NR_(?P<name>[a-z0-9_]+) (?P<nr>[0-9]+)')
+    with open('/usr/include/asm/unistd_64.h') as f:
+        for line in f:
+            m = pattern.match(line)
+            if m:
+                table[int(m.group('nr'))] = m.group('name')
+    return table
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-p', '--pid', type=int, default=-1,
+                        help='PID of process to trace')
+    parser.add_argument('-l', '--latency', action='store_true',
+                        help='Record timing information')
+    parser.add_argument('-d', '--debug', action='store_true',
+                        help='Print BPF text')
+    return parser.parse_args()
+
+
+def build_program(pid, trace_latency):
+    program_template = '''
+        struct key_t {
+            long syscall_nr;
+            u32 tid;
+        };
+
+        BPF_HASH(counts, long, u64);
+        BPF_HASH(tottimes, long, u64);
+        BPF_HASH(times, struct key_t, u64);
+
+        TRACEPOINT_PROBE(raw_syscalls, sys_enter) {
+            %(pid_filter)s
+            %(latency_start)s
+            counts.increment(args->id);
+            return 0;
+        };
+
+        %(sys_exit_probe)s
+    '''
+
+    pid_filter = ''
+    latency_start = ''
+    sys_exit_probe = ''
+
+    if pid != -1:
+        pid_filter = '''
+            u32 pid = (u32) (bpf_get_current_pid_tgid() >> 32);
+            if (pid != %d) { return 0; }
+        ''' % pid
+
+    if trace_latency:
+        latency_start = '''
+            struct key_t key = {0};
+            key.syscall_nr = args->id;
+            key.tid = (u32) bpf_get_current_pid_tgid();
+            u64 now = bpf_ktime_get_ns();
+            times.update(&key, &now);
+        '''
+        sys_exit_probe = '''
+            TRACEPOINT_PROBE(raw_syscalls, sys_exit) {
+                struct key_t key = {0};
+                key.syscall_nr = args->id;
+                key.tid = (u32) bpf_get_current_pid_tgid();
+                u64 now = bpf_ktime_get_ns();
+                u64 *start = 0;
+                u64 total = 0;
+                u64 zero = 0;
+                if ((start = times.lookup(&key)) && now > *start) {
+                    // FIXME racy!
+                    u64 *t  = tottimes.lookup_or_init(&key.syscall_nr, &zero);
+                    total = *t;
+                    total += (now - *start);
+
+                    tottimes.update(&key.syscall_nr, &total);
+                }
+                return 0;
+            }
+        '''
+
+    return program_template % {'pid_filter': pid_filter,
+                               'latency_start': latency_start,
+                               'sys_exit_probe': sys_exit_probe}
+
+
+def main():
+    syscall_table = gen_syscall_table()
+    args = parse_args()
+    program_text = build_program(args.pid, args.latency)
+    if args.debug:
+        print(program_text)
+    b = bcc.BPF(text=program_text)
+
+    while True:
+        counts = b['counts']
+        stats = [(k.value, v.value) for k, v in counts.items()]
+        tottimes = {k.value: v.value for k, v in b['tottimes'].items()}
+
+        for syscall_nr, count in sorted(stats):
+            print (syscall_table[syscall_nr], count,
+                   (tottimes.get(syscall_nr, 0) / 1e9 / count))
+        print '\n\n'
+        time.sleep(1)
+
+
+if __name__ == '__main__':
+    main()
