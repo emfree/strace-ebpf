@@ -1,4 +1,4 @@
-Some initial experiments show that syscall tracing using eBPF has way lower
+Some initial experiments show that syscall tracing using eBPF has much lower
 overhead than using strace:
 
 ```
@@ -16,4 +16,4 @@ $ strace -c dd if=/dev/zero of=/dev/null bs=512 count=100k
 
 But we should also be able to stuff like include user stacks (which `strace`
 doesn't) and humanize call arguments and return values (which `perf trace`
-doesn't, as far as I know).
+doesn't, as far as I know). Lots to do...
